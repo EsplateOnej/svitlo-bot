@@ -217,12 +217,40 @@ def check_schedule(state):
     g = fetch_schedule()
     msgs = []
 
-    # 1) schedule published / changed
-    fp = schedule_fingerprint(g)
-    if state.get("schedule_fp") != fp:
-        prefix = "🔄 График изменился!\n\n" if state.get("schedule_fp") else ""
-        msgs.append(prefix + format_schedule(g))
-        state["schedule_fp"] = fp
+    # 1) schedule published / changed — compared per calendar date, so the
+    #    midnight shift "tomorrow -> today" is not reported as a change
+    old_days = state.get("days")
+    first_run = old_days is None and "schedule_fp" not in state
+    silent = old_days is None and not first_run      # upgrade from older state format
+    old_days = old_days or {}
+    new_days = {}
+    if first_run:
+        msgs.append(format_schedule(g))
+    for key, title in (("today", "сегодня"), ("tomorrow", "завтра")):
+        day = g.get(key)
+        if not day:
+            continue
+        d = day_date(day).isoformat()
+        cur = {"status": day.get("status"), "offs": [list(x) for x in outages(day)]}
+        new_days[d] = cur
+        old = old_days.get(d)
+        if first_run or silent or old == cur:
+            continue
+        label = f"{title} ({day_date(day):%d.%m})"
+        if cur["status"] == "EmergencyShutdowns":
+            if not old or old["status"] != "EmergencyShutdowns":
+                msgs.append(f"🚨 <b>Аварийные отключения</b> на {label}!\n"
+                            f"Графики сейчас не действуют, свет могут отключить в любой момент.")
+        elif old is None or (old["status"] == "WaitingForSchedule" and cur["status"] == "ScheduleApplies"):
+            if cur["status"] == "ScheduleApplies":
+                msgs.append(f"📅 Вышел график на {label}\n\n" + format_day(title.capitalize(), day))
+        elif old["status"] == "EmergencyShutdowns" and cur["status"] == "ScheduleApplies":
+            msgs.append(f"✅ Аварийные отключения отменены, снова действует график\n\n"
+                        + format_day(title.capitalize(), day))
+        elif cur["status"] == "ScheduleApplies":
+            msgs.append(f"🔄 <b>График на {label} изменился</b>\n\n" + format_day(title.capitalize(), day))
+    state["days"] = new_days
+    state.pop("schedule_fp", None)
 
     # 2) reminders before off / on
     t = now()
@@ -500,6 +528,40 @@ def grid_online():
     return None
 
 
+def scheduled_window(state, t, slack=15):
+    """Planned outage (start, end) that covers moment t (± slack minutes), if any."""
+    g = state.get("last_schedule")
+    if not g:
+        return None
+    pad = timedelta(minutes=slack)
+    for st, en in absolute_events(g):
+        if st - pad <= t <= en + pad:
+            return st, en
+    return None
+
+
+def check_expected(state):
+    """15-45 min after a planned change, warn if reality doesn't match the schedule."""
+    h, g = state.get("home"), state.get("last_schedule")
+    if not POWER_SOURCE or not h or not g:
+        return
+    t = now()
+    done = set(state.get("checked", []))
+    for st, en in absolute_events(g):
+        for kind, moment in (("off", st), ("on", en)):
+            key = f"{kind}:{moment.isoformat()}"
+            ago = (t - moment).total_seconds() / 60
+            if key in done or not 15 <= ago <= 45:
+                continue
+            done.add(key)
+            if kind == "off" and h["online"]:
+                send(f"🤔 По графику свет должны были отключить в {moment:%H:%M}, но он есть")
+            elif kind == "on" and not h["online"]:
+                send(f"⏳ По графику свет должны были дать в {moment:%H:%M}, но его пока нет")
+    cutoff = (t - timedelta(days=2)).isoformat()
+    state["checked"] = sorted(k for k in done if k.split(":", 1)[1] >= cutoff)
+
+
 def check_home(state):
     if not POWER_SOURCE:
         return
@@ -515,10 +577,16 @@ def check_home(state):
     if prev["online"] == online:
         return
     since = datetime.fromisoformat(prev["since"])
+    ev = scheduled_window(state, t)
     if online:
-        send(f"💡 <b>Свет появился</b> в {t:%H:%M}\nНе было: {dur(t - since)}")
+        note = ""
+        if ev and t < ev[1] - timedelta(minutes=15):
+            note = f"\nРаньше графика (по графику до {ev[1]:%H:%M})"
+        send(f"💡 <b>Свет появился</b> в {t:%H:%M}\nНе было: {dur(t - since)}{note}")
     else:
-        msg = f"🔌 <b>Свет пропал</b> около {t:%H:%M}\nБыл: {dur(t - since)}"
+        note = (f"По графику: {ev[0]:%H:%M}–{ev[1]:%H:%M}" if ev
+                else "⚠️ Не по графику — возможно, аварийное отключение")
+        msg = f"🔌 <b>Свет пропал</b> около {t:%H:%M}\nБыл: {dur(t - since)}\n{note}"
         if stations_configured():
             msg += "\n\n" + format_stations()
         send(msg)
@@ -573,7 +641,7 @@ def main():
         return
     state = load_state()
     errors = []
-    for step in (handle_commands, check_schedule, check_home, check_stations):
+    for step in (check_schedule, check_home, check_expected, check_stations):
         try:
             step(state)
         except Exception as e:  # noqa: BLE001
