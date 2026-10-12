@@ -39,5 +39,9 @@
   }
  },
  "reminded": [],
- "schedule_fp": "0b7350fd82c6"
+ "schedule_fp": "0b7350fd82c6",
+ "st_alert": {},
+ "st_full": {
+  "Venus E 3.0 6d41": true
+ }
 }
