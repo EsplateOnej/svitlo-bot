@@ -445,6 +445,12 @@ def check_stations(state):
     st, errs = get_stations()
     if errs and not st:
         raise RuntimeError("; ".join(errs))
+    # snapshot for the Cloudflare worker's /power (rounded so state.json changes rarely)
+    state["stations"] = [{"name": s["name"], "brand": s.get("brand"), "soc": s["soc"],
+                          "in": round(s["in"] / 10) * 10, "out": round(s["out"] / 10) * 10,
+                          "charging": s["charging"], "stale": s.get("stale"),
+                          "remain": round(s["remain"] / 10) * 10 if s.get("remain") else None}
+                         for s in st]
     alerts = state.setdefault("st_alert", {})
     full = state.setdefault("st_full", {})
     for s in st:
