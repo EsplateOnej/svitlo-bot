@@ -43,5 +43,17 @@
  "st_alert": {},
  "st_full": {
   "Venus E 3.0 6d41": true
- }
+ },
+ "stations": [
+  {
+   "brand": "marstek",
+   "charging": false,
+   "in": 0,
+   "name": "Venus E 3.0 6d41",
+   "out": 0,
+   "remain": null,
+   "soc": 100,
+   "stale": null
+  }
+ ]
 }
