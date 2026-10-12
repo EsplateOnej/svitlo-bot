@@ -12,23 +12,6 @@
     ]
    ],
    "status": "ScheduleApplies"
-  },
-  "2026-10-13": {
-   "offs": [
-    [
-     0,
-     30
-    ],
-    [
-     480,
-     690
-    ],
-    [
-     1020,
-     1230
-    ]
-   ],
-   "status": "ScheduleApplies"
   }
  },
  "last_schedule": {
