@@ -1,0 +1,54 @@
+name: svitlo-bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 min (GitHub may delay runs by a few minutes)
+  workflow_dispatch:         # "Run workflow" button for a manual test
+
+permissions:
+  contents: write            # to save state.json back to the repo
+
+concurrency:
+  group: svitlo
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run bot
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          HOME_HOST: ${{ secrets.HOME_HOST }}
+          HOME_PORT: ${{ vars.HOME_PORT }}
+          QUEUE: ${{ vars.QUEUE }}
+          REMIND_MINUTES: ${{ vars.REMIND_MINUTES }}
+          POWER_SOURCE: ${{ vars.POWER_SOURCE }}
+          ECOFLOW_ACCESS_KEY: ${{ secrets.ECOFLOW_ACCESS_KEY }}
+          ECOFLOW_SECRET_KEY: ${{ secrets.ECOFLOW_SECRET_KEY }}
+          ECOFLOW_SN: ${{ secrets.ECOFLOW_SN }}
+          ECOFLOW_HOST: ${{ vars.ECOFLOW_HOST }}
+          ECOFLOW_NAME: ${{ vars.ECOFLOW_NAME }}
+          ECOFLOW_CAPACITY_WH: ${{ vars.ECOFLOW_CAPACITY_WH }}
+          MARSTEK_EMAIL: ${{ secrets.MARSTEK_EMAIL }}
+          MARSTEK_PASSWORD: ${{ secrets.MARSTEK_PASSWORD }}
+          MARSTEK_CAPACITY_WH: ${{ vars.MARSTEK_CAPACITY_WH }}
+          MARSTEK_MIN_SOC: ${{ vars.MARSTEK_MIN_SOC }}
+          LOW_LEVELS: ${{ vars.LOW_LEVELS }}
+          STATION_DEBUG: ${{ vars.STATION_DEBUG }}
+        run: python3 bot.py
+
+      - name: Save state
+        run: |
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git config user.name "svitlo-bot"
+            git config user.email "svitlo-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "state update" -q
+            git pull --rebase -q || true
+            git push -q
+          fi
