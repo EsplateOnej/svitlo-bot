@@ -1,4 +1,36 @@
 {
+ "days": {
+  "2026-10-12": {
+   "offs": [
+    [
+     540,
+     750
+    ],
+    [
+     1320,
+     1440
+    ]
+   ],
+   "status": "ScheduleApplies"
+  },
+  "2026-10-13": {
+   "offs": [
+    [
+     0,
+     30
+    ],
+    [
+     480,
+     690
+    ],
+    [
+     1020,
+     1230
+    ]
+   ],
+   "status": "ScheduleApplies"
+  }
+ },
  "last_schedule": {
   "today": {
    "date": "2026-10-12T00:00:00+03:00",
@@ -30,16 +62,42 @@
    "date": "2026-10-13T00:00:00+03:00",
    "slots": [
     {
-     "end": 1440,
+     "end": 30,
      "start": 0,
+     "type": "Definite"
+    },
+    {
+     "end": 480,
+     "start": 30,
+     "type": "NotPlanned"
+    },
+    {
+     "end": 690,
+     "start": 480,
+     "type": "Definite"
+    },
+    {
+     "end": 1020,
+     "start": 690,
+     "type": "NotPlanned"
+    },
+    {
+     "end": 1230,
+     "start": 1020,
+     "type": "Definite"
+    },
+    {
+     "end": 1440,
+     "start": 1230,
      "type": "NotPlanned"
     }
    ],
-   "status": "WaitingForSchedule"
+   "status": "ScheduleApplies"
   }
  },
- "reminded": [],
- "schedule_fp": "0b7350fd82c6",
+ "reminded": [
+  "off:2026-10-12T22:00:00+03:00"
+ ],
  "st_alert": {},
  "st_full": {
   "Venus E 3.0 6d41": true
@@ -53,7 +111,7 @@
    "out": 0,
    "remain": null,
    "soc": 100,
-   "stale": null
+   "stale": "12.10 20:40"
   }
  ]
 }
