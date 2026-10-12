@@ -1,18 +1,5 @@
 {
  "days": {
-  "2026-10-12": {
-   "offs": [
-    [
-     540,
-     750
-    ],
-    [
-     1320,
-     1440
-    ]
-   ],
-   "status": "ScheduleApplies"
-  },
   "2026-10-13": {
    "offs": [
     [
@@ -29,36 +16,14 @@
     ]
    ],
    "status": "ScheduleApplies"
+  },
+  "2026-10-14": {
+   "offs": [],
+   "status": "WaitingForSchedule"
   }
  },
  "last_schedule": {
   "today": {
-   "date": "2026-10-12T00:00:00+03:00",
-   "slots": [
-    {
-     "end": 540,
-     "start": 0,
-     "type": "NotPlanned"
-    },
-    {
-     "end": 750,
-     "start": 540,
-     "type": "Definite"
-    },
-    {
-     "end": 1320,
-     "start": 750,
-     "type": "NotPlanned"
-    },
-    {
-     "end": 1440,
-     "start": 1320,
-     "type": "Definite"
-    }
-   ],
-   "status": "ScheduleApplies"
-  },
-  "tomorrow": {
    "date": "2026-10-13T00:00:00+03:00",
    "slots": [
     {
@@ -93,6 +58,11 @@
     }
    ],
    "status": "ScheduleApplies"
+  },
+  "tomorrow": {
+   "date": "2026-10-14T00:00:00+03:00",
+   "slots": [],
+   "status": "WaitingForSchedule"
   }
  },
  "reminded": [
