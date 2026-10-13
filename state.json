@@ -79,9 +79,9 @@
    "in": 800,
    "name": "Venus E 3.0 6d41",
    "out": 0,
-   "remain": 0,
-   "soc": 99,
-   "stale": "12.10 20:40"
+   "remain": 60,
+   "soc": 84,
+   "stale": "13.10 19:07"
   }
  ]
 }
