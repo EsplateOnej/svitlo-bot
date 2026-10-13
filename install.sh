@@ -36,6 +36,15 @@ if [ ! -f "$ENV_FILE" ] || [ "${1:-}" = "--reconfigure" ]; then
   read -rp  "Email второго аккаунта Marstek (Enter — пропустить): " MS_EMAIL </dev/tty
   MS_PWD=""
   if [ -n "$MS_EMAIL" ]; then read -rsp "Пароль Marstek: " MS_PWD </dev/tty; echo; fi
+  read -rp  "EcoFlow Access Key (Enter — пропустить): " EF_AK </dev/tty
+  EF_SK=""; EF_SN=""; EF_NAME=""; POWER_SOURCE=""
+  if [ -n "$EF_AK" ]; then
+    read -rsp "EcoFlow Secret Key: " EF_SK </dev/tty; echo
+    read -rp  "Серийный номер EcoFlow (SN): " EF_SN </dev/tty
+    read -rp  "Как называть станцию в сообщениях (например Delta 2): " EF_NAME </dev/tty
+    read -rp  "EcoFlow подключена к розетке и по ней определять, есть ли свет? (y/n): " YN </dev/tty
+    case "$YN" in [yYдД]*) POWER_SOURCE=ecoflow ;; esac
+  fi
   read -rsp "Ключ alerts.in.ua для воздушной тревоги (Enter — пропустить): " ALERTS </dev/tty; echo
   umask 077
   cat > "$ENV_FILE" <<EOF
@@ -44,6 +53,11 @@ TG_CHAT_ID=-5549498327
 QUEUE=18.1
 MARSTEK_EMAIL=$MS_EMAIL
 MARSTEK_PASSWORD=$MS_PWD
+ECOFLOW_ACCESS_KEY=$EF_AK
+ECOFLOW_SECRET_KEY=$EF_SK
+ECOFLOW_SN=$EF_SN
+ECOFLOW_NAME=$EF_NAME
+POWER_SOURCE=$POWER_SOURCE
 ALERTS_TOKEN=$ALERTS
 STATE_FILE=$DATA_DIR/state.json
 EOF
