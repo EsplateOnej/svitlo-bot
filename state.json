@@ -75,12 +75,12 @@
  "stations": [
   {
    "brand": "marstek",
-   "charging": false,
-   "in": 0,
+   "charging": true,
+   "in": 800,
    "name": "Venus E 3.0 6d41",
    "out": 0,
-   "remain": null,
-   "soc": 100,
+   "remain": 0,
+   "soc": 99,
    "stale": "12.10 20:40"
   }
  ]
