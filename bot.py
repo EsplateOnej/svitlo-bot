@@ -42,7 +42,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Europe/Kyiv")
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+STATE_FILE = os.environ.get("STATE_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "")
@@ -109,15 +109,17 @@ def http_json(url, data=None, timeout=20):
         return json.loads(r.read().decode("utf-8"))
 
 
-def send(text):
+def send(text, reply_to=None):
     if DRY_RUN or not TG_TOKEN:
         print("---- MESSAGE ----\n" + text + "\n-----------------")
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    body = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    if reply_to:
+        body["reply_to_message_id"] = reply_to
     for attempt in range(3):
         try:
-            http_json(url, {"chat_id": CHAT_ID, "text": text,
-                            "parse_mode": "HTML", "disable_web_page_preview": True})
+            http_json(url, body)
             return
         except Exception as e:  # noqa: BLE001
             print(f"send failed ({attempt + 1}/3): {e}", file=sys.stderr)
@@ -593,13 +595,72 @@ def check_home(state):
     state["home"] = {"online": online, "since": t.isoformat()}
 
 
+# ---------------------------------------------------------------- air raid alerts
+ALERTS_TOKEN = os.environ.get("ALERTS_TOKEN", "").strip()
+ALERT_UID = os.environ.get("ALERT_UID") or "31"          # 31 = м. Київ (alerts.in.ua)
+ALERT_NAME = os.environ.get("ALERT_NAME") or "м. Київ"
+
+
+def check_alerts(state):
+    """alerts.in.ua IoT endpoint: "A" = alert, "P" = partial, "N" = no alert."""
+    if not ALERTS_TOKEN:
+        return
+    url = (f"https://api.alerts.in.ua/v1/iot/active_air_raid_alerts/{ALERT_UID}.json?"
+           + urllib.parse.urlencode({"token": ALERTS_TOKEN}))
+    try:
+        req = urllib.request.Request(url, headers=UA)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = json.loads(r.read().decode())
+    except Exception as e:  # noqa: BLE001  (don't leak the token in the URL)
+        raise RuntimeError(f"alerts.in.ua недоступен ({type(e).__name__})") from None
+    active = str(raw).strip().upper() in ("A", "P")
+    t = now()
+    prev = state.get("alert")
+    if prev is None:
+        state["alert"] = {"active": active, "since": t.isoformat()}
+        return
+    if prev["active"] == active:
+        return
+    since = datetime.fromisoformat(prev["since"])
+    if active:
+        send(f"🚨 <b>Повітряна тривога</b> — {ALERT_NAME}\nПочаток: {t:%H:%M}. Пройдіть в укриття!")
+    else:
+        send(f"✅ <b>Відбій тривоги</b> — {ALERT_NAME}\nТривала: {dur(t - since)}")
+    state["alert"] = {"active": active, "since": t.isoformat()}
+
+
 # ---------------------------------------------------------------- commands
 HELP = ("Команды:\n/graf — график отключений\n/status — есть ли сейчас свет дома\n"
         "/power — заряд станций")
 
 
+def command_reply(state, text):
+    """Text of the reply to a command, or None if it isn't ours."""
+    global _stations_cache
+    cmd = (text or "").strip().split()[0].split("@")[0].lower() if (text or "").strip() else ""
+    if cmd in ("/graf", "/schedule"):
+        try:
+            g = fetch_schedule()
+        except Exception:  # noqa: BLE001
+            g = state.get("last_schedule")
+        return format_schedule(g) if g else "Графика пока нет"
+    if cmd == "/power":
+        _stations_cache = None          # fresh data on demand
+        return "🔋 <b>Станции</b>\n" + format_stations()
+    if cmd == "/status":
+        h = state.get("home")
+        if not h:
+            return "Мониторинг света дома пока не настроен"
+        since = datetime.fromisoformat(h["since"])
+        return (f"{'💡 Свет есть' if h['online'] else '🔌 Света нет'} "
+                f"уже {dur(now() - since)} (с {since:%d.%m %H:%M})")
+    if cmd in ("/start", "/help"):
+        return HELP
+    return None
+
+
 def handle_commands(state):
-    """Reply to commands (answered on the next run, up to ~5-15 min delay)."""
+    """One-shot mode: reply to commands received since the last run."""
     if not TG_TOKEN or DRY_RUN:
         return
     offset = state.get("tg_offset", 0)
@@ -612,36 +673,16 @@ def handle_commands(state):
     for u in upd.get("result", []):
         state["tg_offset"] = u["update_id"] + 1
         msg = u.get("message") or {}
-        if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
-            continue
-        text = (msg.get("text") or "").split("@")[0].strip().lower()
-        if text in ("/graf", "/schedule"):
-            g = state.get("last_schedule")
-            send(format_schedule(g) if g else "Графика пока нет")
-        elif text == "/power":
-            send("🔋 <b>Станции</b>\n" + format_stations())
-        elif text == "/status":
-            h = state.get("home")
-            if not h:
-                send("Мониторинг света дома не настроен")
-            else:
-                since = datetime.fromisoformat(h["since"])
-                send(f"{'💡 Свет есть' if h['online'] else '🔌 Света нет'} "
-                     f"уже {dur(now() - since)} (с {since:%d.%m %H:%M})")
-        elif text in ("/start", "/help"):
-            send(HELP)
+        if str(msg.get("chat", {}).get("id")) == str(CHAT_ID):
+            reply = command_reply(state, msg.get("text"))
+            if reply:
+                send(reply, reply_to=msg.get("message_id"))
 
 
-# ---------------------------------------------------------------- main
-def main():
-    if not QUEUE:
-        sys.exit("Укажи QUEUE (например 3.1)")
-    if not DRY_RUN and not (TG_TOKEN and CHAT_ID):
-        print("TG_TOKEN / TG_CHAT_ID ещё не заданы — пропускаю запуск")
-        return
-    state = load_state()
+# ---------------------------------------------------------------- checks
+def run_checks(state, steps):
     errors = []
-    for step in (check_schedule, check_home, check_expected, check_stations):
+    for step in steps:
         try:
             step(state)
         except Exception as e:  # noqa: BLE001
@@ -653,8 +694,79 @@ def main():
         if not last or now() - datetime.fromisoformat(last) > timedelta(hours=6):
             send("⚠️ Ошибка бота:\n" + "\n".join(errors))
             state["last_error_notice"] = now().isoformat()
+
+
+def main():
+    """One-shot mode (GitHub Actions): run all checks once."""
+    if not QUEUE:
+        sys.exit("Укажи QUEUE (например 3.1)")
+    if not DRY_RUN and not (TG_TOKEN and CHAT_ID):
+        print("TG_TOKEN / TG_CHAT_ID ещё не заданы — пропускаю запуск")
+        return
+    state = load_state()
+    run_checks(state, (check_schedule, check_home, check_expected, check_stations, check_alerts))
     save_state(state)
 
 
+# ---------------------------------------------------------------- server mode
+STATION_EVERY = int(os.environ.get("STATION_EVERY_MIN") or 5)
+
+
+def serve():
+    """Always-on mode (VPS): checks every minute, instant replies to commands."""
+    import threading
+    global _stations_cache
+    if not (QUEUE and TG_TOKEN and CHAT_ID):
+        sys.exit("Нужны QUEUE, TG_TOKEN и TG_CHAT_ID")
+    api = f"https://api.telegram.org/bot{TG_TOKEN}"
+    http_json(f"{api}/deleteWebhook", {"drop_pending_updates": False})
+    http_json(f"{api}/setMyCommands", {"commands": [
+        {"command": "graf", "description": "График отключений"},
+        {"command": "status", "description": "Есть ли сейчас свет дома"},
+        {"command": "power", "description": "Заряд станций"}]})
+    lock = threading.Lock()
+    state = load_state()
+    print("svitlo-bot: server mode started", flush=True)
+
+    def checker():
+        last_st = None
+        while True:
+            t = now()
+            steps = [check_schedule, check_home, check_expected, check_alerts]
+            if last_st is None or t - last_st >= timedelta(minutes=STATION_EVERY):
+                steps.append(check_stations)
+                last_st = t
+            with lock:
+                global _stations_cache
+                _stations_cache = None
+                run_checks(state, steps)
+                save_state(state)
+            time.sleep(max(5, 60 - datetime.now().second))
+
+    threading.Thread(target=checker, daemon=True).start()
+
+    offset = 0
+    while True:
+        try:
+            upd = http_json(f"{api}/getUpdates?" + urllib.parse.urlencode(
+                {"offset": offset, "timeout": 50, "allowed_updates": '["message"]'}), timeout=60)
+        except Exception as e:  # noqa: BLE001
+            print(f"getUpdates failed: {e}", file=sys.stderr, flush=True)
+            time.sleep(5)
+            continue
+        for u in upd.get("result", []):
+            offset = u["update_id"] + 1
+            msg = u.get("message") or {}
+            if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
+                continue
+            with lock:
+                try:
+                    reply = command_reply(state, msg.get("text"))
+                except Exception as e:  # noqa: BLE001
+                    reply = f"⚠️ Не получилось: {e}"
+            if reply:
+                send(reply, reply_to=msg.get("message_id"))
+
+
 if __name__ == "__main__":
-    main()
+    serve() if "--serve" in sys.argv else main()
