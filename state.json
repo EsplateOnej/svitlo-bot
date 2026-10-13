@@ -1,11 +1,7 @@
 {
  "days": {
-  "2026-10-13": {
+  "2026-10-14": {
    "offs": [
-    [
-     0,
-     30
-    ],
     [
      480,
      690
@@ -17,23 +13,18 @@
    ],
    "status": "ScheduleApplies"
   },
-  "2026-10-14": {
+  "2026-10-15": {
    "offs": [],
    "status": "WaitingForSchedule"
   }
  },
  "last_schedule": {
   "today": {
-   "date": "2026-10-13T00:00:00+03:00",
+   "date": "2026-10-14T00:00:00+03:00",
    "slots": [
     {
-     "end": 30,
-     "start": 0,
-     "type": "Definite"
-    },
-    {
      "end": 480,
-     "start": 30,
+     "start": 0,
      "type": "NotPlanned"
     },
     {
@@ -60,7 +51,7 @@
    "status": "ScheduleApplies"
   },
   "tomorrow": {
-   "date": "2026-10-14T00:00:00+03:00",
+   "date": "2026-10-15T00:00:00+03:00",
    "slots": [],
    "status": "WaitingForSchedule"
   }
@@ -75,12 +66,12 @@
  "stations": [
   {
    "brand": "marstek",
-   "charging": true,
-   "in": 800,
+   "charging": false,
+   "in": 0,
    "name": "Venus E 3.0 6d41",
    "out": 0,
-   "remain": 60,
-   "soc": 84,
+   "remain": null,
+   "soc": 100,
    "stale": "13.10 19:07"
   }
  ]
