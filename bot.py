@@ -48,7 +48,7 @@ TG_TOKEN = os.environ.get("TG_TOKEN", "")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 QUEUE = os.environ.get("QUEUE", "").strip()
 HOME_HOST = os.environ.get("HOME_HOST", "").strip()
-HOME_PORT = int(os.environ.get("HOME_PORT") or 80)
+HOME_PORT = int(os.environ.get("HOME_PORT") or 80)   # 0 = ping
 REMIND = int(os.environ.get("REMIND_MINUTES") or 30)
 REGION = os.environ.get("YASNO_REGION") or "25"
 DSO = os.environ.get("YASNO_DSO") or "902"
@@ -369,6 +369,9 @@ def ecoflow_stations():
     return res
 
 
+_ms_seen = {}   # devid -> (last report_time value, our time when it last changed)
+
+
 def marstek_stations():
     pwd = hashlib.md5(MS_PWD.encode()).hexdigest()
     login_q = urllib.parse.urlencode({"pwd": pwd, "mailbox": MS_EMAIL})
@@ -394,13 +397,15 @@ def marstek_stations():
         item = {"name": d.get("name") or "Marstek", "soc": round(soc), "in": round(chg),
                 "out": round(dsg), "charging": charging, "grid": None, "brand": "marstek",
                 "remain": estimate(soc, MS_CAP, MS_MIN_SOC, chg if charging else dsg, charging)}
+        # The cloud's report_time has an odd timezone, so don't trust it as a clock:
+        # the device is "stale" only if report_time stops changing for 45+ minutes.
         rt = d.get("report_time")
-        try:
-            rt = float(rt)
-            if rt > 1e9 and time.time() - rt > 30 * 60:
-                item["stale"] = datetime.fromtimestamp(rt, TZ).strftime("%d.%m %H:%M")
-        except (TypeError, ValueError):
-            pass
+        key = str(d.get("devid") or item["name"])
+        seen = _ms_seen.get(key)
+        if seen is None or seen[0] != rt:
+            _ms_seen[key] = (rt, time.time())
+        elif time.time() - seen[1] > 45 * 60:
+            item["stale"] = datetime.fromtimestamp(seen[1], TZ).strftime("%d.%m %H:%M")
         res.append(item)
     return res
 
@@ -510,12 +515,21 @@ def check_stations(state):
 
 # ---------------------------------------------------------------- home power
 def home_online():
+    """HOME_PORT=0 -> ICMP ping (works on a VPS), otherwise a TCP connect."""
+    import subprocess
     for _ in range(3):
-        try:
-            with socket.create_connection((HOME_HOST, HOME_PORT), timeout=6):
+        if HOME_PORT == 0:
+            r = subprocess.run(["ping", "-c", "1", "-W", "3", HOME_HOST],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode == 0:
                 return True
-        except OSError:
-            time.sleep(4)
+        else:
+            try:
+                with socket.create_connection((HOME_HOST, HOME_PORT), timeout=6):
+                    return True
+            except OSError:
+                pass
+        time.sleep(4)
     return False
 
 
