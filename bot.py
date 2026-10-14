@@ -109,7 +109,7 @@ def http_json(url, data=None, timeout=20):
         return json.loads(r.read().decode("utf-8"))
 
 
-def send(text, reply_to=None):
+def send(text, reply_to=None, _orig=None):
     if DRY_RUN or not TG_TOKEN:
         print("---- MESSAGE ----\n" + text + "\n-----------------")
         return
@@ -124,6 +124,22 @@ def send(text, reply_to=None):
         except Exception as e:  # noqa: BLE001
             print(f"send failed ({attempt + 1}/3): {e}", file=sys.stderr)
             time.sleep(3)
+    if not reply_to:                       # keep it and retry on the next check
+        _OUTBOX.append(_orig or {"text": text, "ts": time.time()})
+
+
+_OUTBOX = []
+
+
+def flush_outbox(state):
+    """Resend notifications that failed earlier (Telegram/network hiccup)."""
+    pending = state.pop("outbox", []) + _OUTBOX[:]
+    _OUTBOX.clear()
+    for m in pending:
+        if time.time() - m["ts"] > 6 * 3600:
+            continue                       # too old to be useful
+        late = datetime.fromtimestamp(m["ts"], TZ)
+        send(f"⌛ <i>(с опозданием, {late:%H:%M})</i>\n" + m["text"], _orig=m)
 
 
 # ---------------------------------------------------------------- schedule
@@ -215,8 +231,17 @@ def absolute_events(g):
     return ev
 
 
+DAILY_AT = os.environ.get("DAILY_AT", "07:30").strip()   # "" = no morning summary
+
+
 def check_schedule(state):
-    g = fetch_schedule()
+    try:
+        g = fetch_schedule()
+    except Exception:
+        # API down: still send reminders from the last known schedule, then report the error
+        if state.get("last_schedule"):
+            schedule_reminders(state, state["last_schedule"])
+        raise
     msgs = []
 
     # 1) schedule published / changed — compared per calendar date, so the
@@ -254,7 +279,22 @@ def check_schedule(state):
     state["days"] = new_days
     state.pop("schedule_fp", None)
 
-    # 2) reminders before off / on
+    for m in msgs:
+        send(m)
+    state["last_schedule"] = {k: g.get(k) for k in ("today", "tomorrow")}
+    schedule_reminders(state, g)
+
+    # 3) morning summary (also shows that the bot is alive)
+    t = now()
+    if DAILY_AT and state.get("daily_sent") != t.date().isoformat() and f"{t:%H:%M}" >= DAILY_AT:
+        if state.get("daily_sent") is not None:      # not on the very first run
+            send("☀️ <b>Доброе утро!</b>\n\n" + format_day("Сегодня", g.get("today")))
+        state["daily_sent"] = t.date().isoformat()
+
+
+def schedule_reminders(state, g):
+    msgs = []
+    # 2) reminders before off / on, and a notice at the moment itself
     t = now()
     sent = set(state.get("reminded", []))
     for st, en in absolute_events(g):
@@ -269,10 +309,16 @@ def check_schedule(state):
                     msgs.append(f"💡 Через {int(left)} мин по графику должны "
                                 f"<b>включить</b> свет ({moment:%H:%M})")
                 sent.add(key)
+            now_key = f"{kind}-now:{moment.isoformat()}"
+            if now_key not in sent and -5 <= left < 0.5:
+                if kind == "off":
+                    msgs.append(f"🔴 По графику <b>сейчас отключение</b> до {en:%H:%M}")
+                else:
+                    msgs.append(f"🟢 По графику свет <b>должны дать сейчас</b> ({moment:%H:%M})")
+                sent.add(now_key)
     # keep only recent reminder keys
     cutoff = (t - timedelta(days=2)).isoformat()
     state["reminded"] = sorted(k for k in sent if k.split(":", 1)[1] >= cutoff)
-    state["last_schedule"] = {k: g.get(k) for k in ("today", "tomorrow")}
     for m in msgs:
         send(m)
 
@@ -289,7 +335,7 @@ MS_PWD = os.environ.get("MARSTEK_PASSWORD", "")
 MS_HOST = os.environ.get("MARSTEK_HOST") or "https://eu.hamedata.com"
 MS_CAP = float(os.environ.get("MARSTEK_CAPACITY_WH") or 5120)   # Venus E 3.0 = 5.12 kWh
 MS_MIN_SOC = float(os.environ.get("MARSTEK_MIN_SOC") or 10)
-LOW_LEVELS = sorted({int(x) for x in (os.environ.get("LOW_LEVELS") or "20,10").split(",") if x.strip()},
+LOW_LEVELS = sorted({int(x) for x in (os.environ.get("LOW_LEVELS") or "50,40,30,20,10").split(",") if x.strip()},
                     reverse=True)
 POWER_SOURCE = (os.environ.get("POWER_SOURCE") or ("router" if HOME_HOST else "")).lower()
 STATION_DEBUG = os.environ.get("STATION_DEBUG") == "1"
@@ -372,7 +418,11 @@ def ecoflow_stations():
 _ms_seen = {}   # devid -> (last report_time value, our time when it last changed)
 
 
-def marstek_stations():
+_ms_token = None
+_ms_raw = []    # last raw device list (for the /marstek command)
+
+
+def marstek_login():
     pwd = hashlib.md5(MS_PWD.encode()).hexdigest()
     login_q = urllib.parse.urlencode({"pwd": pwd, "mailbox": MS_EMAIL})
     req = urllib.request.Request(f"{MS_HOST}/app/Solar/v2_get_device.php?{login_q}",
@@ -384,8 +434,27 @@ def marstek_stations():
         raise RuntimeError(f"Marstek: ошибка входа ({type(e).__name__})") from None
     if not token:
         raise RuntimeError("Marstek: вход не удался — проверь email/пароль")
-    resp = http_json(f"{MS_HOST}/ems/api/v1/getDeviceList?" + urllib.parse.urlencode({"token": token}))
-    devices = [d for d in (resp.get("data") or []) if isinstance(d, dict) and "soc" in d]
+    return token
+
+
+def marstek_stations():
+    global _ms_token, _ms_raw
+    devices = None
+    for _ in range(2):                     # reuse the token; log in again if it expired
+        if not _ms_token:
+            _ms_token = marstek_login()
+        try:
+            resp = http_json(f"{MS_HOST}/ems/api/v1/getDeviceList?"
+                             + urllib.parse.urlencode({"token": _ms_token}))
+        except Exception:  # noqa: BLE001
+            resp = {}
+        if isinstance(resp.get("data"), list):
+            devices = [d for d in resp["data"] if isinstance(d, dict) and "soc" in d]
+            break
+        _ms_token = None
+    if devices is None:
+        raise RuntimeError("Marstek: облако не вернуло список устройств")
+    _ms_raw = [{k: v for k, v in d.items() if k not in ("sn", "devid", "mac", "token")} for d in devices]
     if STATION_DEBUG:
         safe = [{k: v for k, v in d.items() if k not in ("sn", "devid", "mac")} for d in devices]
         print("Marstek devices:", json.dumps(safe, ensure_ascii=False))
@@ -474,6 +543,43 @@ def format_stations():
     return "\n".join(lines) if lines else "Станции не настроены"
 
 
+MODE_MIN_W = 30   # below this the battery counts as idle
+
+
+def station_mode_change(modes, s):
+    """Notify when a station starts/stops charging or discharging (seen 2 checks in a row)."""
+    n, soc = s["name"], s["soc"]
+    if s["in"] >= MODE_MIN_W and s["in"] > s["out"]:
+        mode = "chg"
+    elif s["out"] >= MODE_MIN_W:
+        mode = "dsg"
+    else:
+        mode = "idle"
+    m = modes.get(n)
+    if m is None:
+        modes[n] = {"mode": mode, "cand": None}
+        return
+    if mode == m["mode"]:
+        m["cand"] = None
+        return
+    if m.get("cand") != mode:              # first sighting: wait one more check
+        m["cand"] = mode
+        return
+    old, m["mode"], m["cand"] = m["mode"], mode, None
+    rem = s.get("remain")
+    if mode == "chg":
+        extra = f" · до полной ~{dur(timedelta(minutes=rem))}" if rem else ""
+        send(f"⚡ <b>{n}</b> начала заряжаться: +{s['in']} Вт, {soc}%{extra}")
+    elif mode == "dsg":
+        extra = f" · хватит на ~{dur(timedelta(minutes=rem))}" if rem else ""
+        send(f"🔋 <b>{n}</b> разряжается: −{s['out']} Вт, {soc}%{extra}")
+    elif old == "chg":
+        if soc < 99:                       # at 100% the "заряжена до 100%" message covers it
+            send(f"⏸ <b>{n}</b> перестала заряжаться ({soc}%)")
+    else:
+        send(f"⏸ <b>{n}</b> перестала разряжаться ({soc}%)")
+
+
 def check_stations(state):
     if not stations_configured():
         return
@@ -488,11 +594,13 @@ def check_stations(state):
                          for s in st]
     alerts = state.setdefault("st_alert", {})
     full = state.setdefault("st_full", {})
+    modes = state.setdefault("st_mode", {})
     for s in st:
         if s.get("stale"):
             continue
         n, soc = s["name"], s["soc"]
         first_time = n not in full
+        station_mode_change(modes, s)
         # low charge: alert once per level, reset after recharging above top level + 5%
         crossed = [lv for lv in LOW_LEVELS if soc <= lv]
         last = alerts.get(n)
@@ -668,6 +776,13 @@ def command_reply(state, text):
         since = datetime.fromisoformat(h["since"])
         return (f"{'💡 Свет есть' if h['online'] else '🔌 Света нет'} "
                 f"уже {dur(now() - since)} (с {since:%d.%m %H:%M})")
+    if cmd == "/marstek":
+        _stations_cache = None
+        get_stations()
+        if not _ms_raw:
+            return "Нет данных Marstek"
+        body = json.dumps(_ms_raw, ensure_ascii=False, indent=1)[:3500]
+        return "<b>Данные Marstek из облака</b>\n<pre>" + body.replace("<", "&lt;") + "</pre>"
     if cmd in ("/start", "/help"):
         return HELP
     return None
@@ -695,6 +810,7 @@ def handle_commands(state):
 
 # ---------------------------------------------------------------- checks
 def run_checks(state, steps):
+    flush_outbox(state)
     errors = []
     for step in steps:
         try:
@@ -702,12 +818,19 @@ def run_checks(state, steps):
         except Exception as e:  # noqa: BLE001
             print(f"{step.__name__}: {e}", file=sys.stderr)
             errors.append(f"{step.__name__}: {e}")
-    # warn about problems at most once per 6 hours
-    if errors:
+    # warn only about problems that last 15+ minutes, at most once per 6 hours
+    if not errors:
+        state.pop("err_since", None)
+    else:
+        since = datetime.fromisoformat(state.setdefault("err_since", now().isoformat()))
         last = state.get("last_error_notice")
-        if not last or now() - datetime.fromisoformat(last) > timedelta(hours=6):
+        if now() - since >= timedelta(minutes=15) and (
+                not last or now() - datetime.fromisoformat(last) > timedelta(hours=6)):
             send("⚠️ Ошибка бота:\n" + "\n".join(errors))
             state["last_error_notice"] = now().isoformat()
+    if _OUTBOX:
+        state["outbox"] = _OUTBOX[:]
+        _OUTBOX.clear()
 
 
 def main():
@@ -723,7 +846,7 @@ def main():
 
 
 # ---------------------------------------------------------------- server mode
-STATION_EVERY = int(os.environ.get("STATION_EVERY_MIN") or 5)
+STATION_EVERY = int(os.environ.get("STATION_EVERY_MIN") or 2)
 
 
 def serve():
@@ -750,17 +873,23 @@ def serve():
             if last_st is None or t - last_st >= timedelta(minutes=STATION_EVERY):
                 steps.append(check_stations)
                 last_st = t
-            with lock:
-                global _stations_cache
-                _stations_cache = None
-                run_checks(state, steps)
-                save_state(state)
+            try:
+                with lock:
+                    global _stations_cache
+                    _stations_cache = None
+                    run_checks(state, steps)
+                    save_state(state)
+            except Exception as e:  # noqa: BLE001  (never let the checker die)
+                print(f"checker error: {e}", file=sys.stderr, flush=True)
             time.sleep(max(5, 60 - datetime.now().second))
 
-    threading.Thread(target=checker, daemon=True).start()
+    worker = threading.Thread(target=checker, daemon=True)
+    worker.start()
 
     offset = 0
     while True:
+        if not worker.is_alive():          # let systemd restart the whole bot
+            sys.exit("checker thread stopped")
         try:
             upd = http_json(f"{api}/getUpdates?" + urllib.parse.urlencode(
                 {"offset": offset, "timeout": 50, "allowed_updates": '["message"]'}), timeout=60)
