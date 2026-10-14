@@ -415,9 +415,6 @@ def ecoflow_stations():
     return res
 
 
-_ms_seen = {}   # devid -> (last report_time value, our time when it last changed)
-
-
 _ms_token = None
 _ms_raw = []    # last raw device list (for the /marstek command)
 
@@ -466,15 +463,18 @@ def marstek_stations():
         item = {"name": d.get("name") or "Marstek", "soc": round(soc), "in": round(chg),
                 "out": round(dsg), "charging": charging, "grid": None, "brand": "marstek",
                 "remain": estimate(soc, MS_CAP, MS_MIN_SOC, chg if charging else dsg, charging)}
-        # The cloud's report_time has an odd timezone, so don't trust it as a clock:
-        # the device is "stale" only if report_time stops changing for 45+ minutes.
-        rt = d.get("report_time")
-        key = str(d.get("devid") or item["name"])
-        seen = _ms_seen.get(key)
-        if seen is None or seen[0] != rt:
-            _ms_seen[key] = (rt, time.time())
-        elif time.time() - seen[1] > 45 * 60:
-            item["stale"] = datetime.fromtimestamp(seen[1], TZ).strftime("%d.%m %H:%M")
+        # The battery reports to the cloud only every ~30 min when idle, so show the data age
+        # and treat it as "no connection" only after 6 hours of silence.
+        try:
+            age = time.time() - float(d.get("report_time"))
+            if 0 <= age < 30 * 86400:
+                item["age_min"] = age / 60
+                if age > 6 * 3600:
+                    item["stale"] = datetime.fromtimestamp(float(d["report_time"]), TZ).strftime("%d.%m %H:%M")
+        except (TypeError, ValueError):
+            pass
+        if float(d.get("load") or 0) > 0:
+            item["load"] = round(float(d["load"]))
         res.append(item)
     return res
 
@@ -534,6 +534,10 @@ def format_station(s):
             line += f" · хватит на ~{dur(timedelta(minutes=s['remain']))}"
     else:
         line += " · ожидание"
+    if s.get("load"):
+        line += f" · потребление {s['load']} Вт"
+    if s.get("age_min", 0) >= 10:
+        line += f" <i>(данные {dur(timedelta(minutes=s['age_min']))} назад)</i>"
     return line
 
 
