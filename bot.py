@@ -190,7 +190,7 @@ def fetch_schedule():
     if QUEUE not in data:
         raise KeyError(f"Очередь {QUEUE} не найдена. Есть: {', '.join(sorted(data))}")
     g = dict(data[QUEUE])
-    if not MOCK and DTEK_URL:
+    if not MOCK and (DTEK_URL or DTEK_MIRROR):
         merge_dtek(g)
     return g
 
@@ -199,36 +199,67 @@ def fetch_schedule():
 # The DTEK site (and the Kyiv Digital app) publish an hourly schedule per queue even when
 # YASNO reports "emergency shutdowns" without hours. When DTEK has data for a day, use it.
 DTEK_URL = os.environ.get("DTEK_URL", "https://www.dtek-kem.com.ua/ua/shutdowns").strip()
-_dtek_cache = {"t": 0, "fact": None, "err": None}
+# The DTEK site blocks datacenter IPs, so first read a public mirror that re-publishes the
+# same DisconSchedule.fact every few minutes (github.com/Baskerville42/outage-data-ua).
+DTEK_MIRROR = os.environ.get(
+    "DTEK_MIRROR",
+    "https://raw.githubusercontent.com/Baskerville42/outage-data-ua/main/data/kyiv.json").strip()
+_dtek_cache = {"t": 0, "fact": None, "err": None, "src": None}
+
+
+def _dtek_from_mirror():
+    req = urllib.request.Request(DTEK_MIRROR, headers={"User-Agent": "svitlo-bot"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    fact = d.get("fact") or {}
+    if not isinstance(fact.get("data"), dict) or not fact["data"]:
+        raise ValueError("в зеркале нет данных")
+    return fact
+
+
+def _dtek_from_site():
+    req = urllib.request.Request(DTEK_URL, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "text/html", "Accept-Language": "uk,ru;q=0.9"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        html = r.read().decode("utf-8", "replace")
+    if "DisconSchedule.fact" not in html:
+        raise ValueError("сайт ДТЭК не отдал график (защита от ботов)")
+    i = html.index("DisconSchedule.fact")
+    j = html.index("{", i)
+    depth = 0
+    for k in range(j, len(html)):
+        if html[k] == "{":
+            depth += 1
+        elif html[k] == "}":
+            depth -= 1
+            if not depth:
+                break
+    return json.loads(html[j:k + 1])
 
 
 def fetch_dtek_fact():
-    """DisconSchedule.fact from the DTEK page: {"data": {unix_day: {"GPV18.1": {"1": "yes"...}}}}."""
-    if time.time() - _dtek_cache["t"] < 240:           # the page is heavy: at most every 4 min
+    """DisconSchedule.fact: {"data": {unix_day: {"GPV18.1": {"1": "yes"...}}}}."""
+    if time.time() - _dtek_cache["t"] < 120:
         return _dtek_cache["fact"]
     _dtek_cache["t"] = time.time()
-    try:
-        req = urllib.request.Request(DTEK_URL, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Accept": "text/html", "Accept-Language": "uk,ru;q=0.9"})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            html = r.read().decode("utf-8", "replace")
-        i = html.index("DisconSchedule.fact")
-        j = html.index("{", i)
-        depth = 0
-        for k in range(j, len(html)):
-            if html[k] == "{":
-                depth += 1
-            elif html[k] == "}":
-                depth -= 1
-                if not depth:
-                    break
-        _dtek_cache["fact"] = json.loads(html[j:k + 1])
-        _dtek_cache["err"] = None
-    except Exception as e:  # noqa: BLE001
-        _dtek_cache["err"] = f"{type(e).__name__}: {e}"
-        print(f"dtek: {_dtek_cache['err']}", file=sys.stderr, flush=True)
+    errs = []
+    for name, fn, on in (("mirror", _dtek_from_mirror, DTEK_MIRROR), ("site", _dtek_from_site, DTEK_URL)):
+        if not on:
+            continue
+        try:
+            _dtek_cache["fact"] = fn()
+            if _dtek_cache["err"] or _dtek_cache["src"] != name:
+                print(f"dtek: ok ({name})", file=sys.stderr, flush=True)
+            _dtek_cache["err"], _dtek_cache["src"] = None, name
+            return _dtek_cache["fact"]
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{name}: {type(e).__name__}: {e}")
+    err = "; ".join(errs)
+    if err != _dtek_cache["err"]:
+        print(f"dtek: {err}", file=sys.stderr, flush=True)
+    _dtek_cache["err"] = err
     return _dtek_cache["fact"]
 
 
