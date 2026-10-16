@@ -15,7 +15,7 @@ if [ "$(id -u)" -ne 0 ]; then echo "Запусти от root (или через 
 echo "==> Устанавливаю зависимости..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq python3 tzdata curl ca-certificates iputils-ping >/dev/null
+apt-get install -y -qq python3 python3-paho-mqtt tzdata curl ca-certificates iputils-ping >/dev/null
 
 id svitlo >/dev/null 2>&1 || useradd --system --home "$DATA_DIR" --shell /usr/sbin/nologin svitlo
 mkdir -p "$APP_DIR" "$DATA_DIR"
