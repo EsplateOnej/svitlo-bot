@@ -37,6 +37,7 @@ import socket
 import sys
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -109,7 +110,21 @@ def http_json(url, data=None, timeout=20):
         return json.loads(r.read().decode("utf-8"))
 
 
+_ENV_CHAT_ID = CHAT_ID      # chat id from the settings (before any group migration)
+
+
+def apply_chat_migration(state):
+    """If the group became a supergroup earlier, keep using its new id."""
+    global CHAT_ID
+    m = state.get("chat_migration") or {}
+    if CHAT_ID != _ENV_CHAT_ID:
+        state["chat_migration"] = {"from": _ENV_CHAT_ID, "to": CHAT_ID}
+    elif m.get("from") == _ENV_CHAT_ID and m.get("to"):
+        CHAT_ID = m["to"]
+
+
 def send(text, reply_to=None, _orig=None):
+    global CHAT_ID
     if DRY_RUN or not TG_TOKEN:
         print("---- MESSAGE ----\n" + text + "\n-----------------")
         return
@@ -121,6 +136,20 @@ def send(text, reply_to=None, _orig=None):
         try:
             http_json(url, body)
             return
+        except urllib.error.HTTPError as e:
+            try:
+                err = json.loads(e.read().decode())
+            except Exception:  # noqa: BLE001
+                err = {}
+            new_id = (err.get("parameters") or {}).get("migrate_to_chat_id")
+            if new_id:                     # group was upgraded to a supergroup
+                print(f"chat migrated to {new_id}", file=sys.stderr, flush=True)
+                CHAT_ID = str(new_id)
+                body["chat_id"] = CHAT_ID
+                body.pop("reply_to_message_id", None)
+                continue
+            print(f"send failed ({attempt + 1}/3): {e} {err.get('description', '')}", file=sys.stderr)
+            time.sleep(3)
         except Exception as e:  # noqa: BLE001
             print(f"send failed ({attempt + 1}/3): {e}", file=sys.stderr)
             time.sleep(3)
@@ -415,7 +444,229 @@ def ecoflow_stations():
     return res
 
 
+# ---------------------------------------------------------------- EcoFlow via app login (MQTT)
+# For models the developer API doesn't expose (e.g. RIVER 3 / 3 Plus) the bot logs in like the
+# EcoFlow app (use a second account the station is shared with) and listens to the device's
+# MQTT stream. Protocol details follow the community project tolwi/hassio-ecoflow-cloud.
+EF_EMAIL = os.environ.get("ECOFLOW_EMAIL", "").strip()
+EF_PASSWORD = os.environ.get("ECOFLOW_PASSWORD", "")
+EF_APP_SN = (os.environ.get("ECOFLOW_APP_SN") or EF_SN).split(",")[0].strip()
+
+# protobuf field numbers -> names (River 3 DisplayPropertyUpload / RuntimePropertyUpload)
+R3_DISPLAY = {3: "pow_in_sum_w", 4: "pow_out_sum_w", 47: "flow_info_ac_in", 53: "pow_get_ac",
+              54: "pow_get_ac_in", 61: "plug_in_info_ac_in_flag", 202: "plug_in_info_ac_charger_flag",
+              242: "bms_batt_soc", 254: "bms_dsg_rem_time", 255: "bms_chg_rem_time",
+              262: "cms_batt_soc", 268: "cms_dsg_rem_time", 269: "cms_chg_rem_time",
+              281: "bms_chg_dsg_state", 282: "cms_chg_dsg_state"}
+R3_RUNTIME = {67: "plug_in_info_ac_out_vol", 68: "plug_in_info_ac_in_vol"}
+
+
+def pb_fields(buf):
+    """Minimal protobuf reader: {field_number: [values]} (varint/int, fixed32 -> float, bytes)."""
+    import struct
+    out, i, n = {}, 0, len(buf)
+
+    def varint():
+        nonlocal i
+        shift = res = 0
+        while True:
+            b = buf[i]
+            i += 1
+            res |= (b & 0x7F) << shift
+            if not b & 0x80:
+                return res
+            shift += 7
+    while i < n:
+        key = varint()
+        num, wt = key >> 3, key & 7
+        if wt == 0:
+            val = varint()
+        elif wt == 1:
+            val = struct.unpack("<d", buf[i:i + 8])[0]
+            i += 8
+        elif wt == 2:
+            ln = varint()
+            val = buf[i:i + ln]
+            i += ln
+        elif wt == 5:
+            val = struct.unpack("<f", buf[i:i + 4])[0]
+            i += 4
+        else:
+            break
+        out.setdefault(num, []).append(val)
+    return out
+
+
+def r3_decode(raw):
+    """Decode a River 3 MQTT message into {name: value}."""
+    import base64
+    try:
+        raw = base64.b64decode(raw, validate=True)
+    except Exception:  # noqa: BLE001
+        pass
+    res = {}
+    for hdr in pb_fields(raw).get(1, []):
+        if not isinstance(hdr, (bytes, bytearray)):
+            continue
+        h = pb_fields(hdr)
+        pdata = (h.get(1) or [b""])[0]
+        if not isinstance(pdata, (bytes, bytearray)) or not pdata:
+            continue
+        g = lambda k: (h.get(k) or [0])[0]  # noqa: E731
+        if g(6) == 1 and g(2) != 32:        # enc_type 1: XOR with the low byte of seq
+            pdata = bytes(b ^ (g(14) & 0xFF) for b in pdata)
+        names = {(254, 21): R3_DISPLAY, (254, 22): R3_RUNTIME}.get((g(8), g(9)))
+        if not names:
+            continue
+        try:
+            fields = pb_fields(pdata)
+        except Exception:  # noqa: BLE001
+            continue
+        for num, name in names.items():
+            if num in fields:
+                res[name] = fields[num][-1]
+    return res
+
+
+class EcoflowApp:
+    def __init__(self, email, password, sn):
+        self.email, self.password, self.sn = email, password, sn
+        self.data, self.updated, self.error, self.client = {}, None, None, None
+        self.user_id = None
+
+    def _login(self):
+        import base64
+        last = None
+        for host in ("api.ecoflow.com", "api-e.ecoflow.com"):
+            try:
+                body = {"email": self.email, "password": base64.b64encode(self.password.encode()).decode(),
+                        "scene": "IOT_APP", "userType": "ECOFLOW"}
+                req = urllib.request.Request(f"https://{host}/auth/login", data=json.dumps(body).encode(),
+                                             headers={**UA, "lang": "en_US", "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    resp = json.loads(r.read().decode())
+                if str(resp.get("code")) not in ("0", "None") or not resp.get("data"):
+                    raise RuntimeError(f"вход: {resp.get('message')} (code {resp.get('code')})")
+                token, self.user_id = resp["data"]["token"], resp["data"]["user"]["userId"]
+                req = urllib.request.Request(
+                    f"https://{host}/iot-auth/app/certification?" + urllib.parse.urlencode({"userId": self.user_id}),
+                    headers={**UA, "lang": "en_US", "authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    return json.loads(r.read().decode())["data"]
+            except Exception as e:  # noqa: BLE001
+                last = e
+        raise RuntimeError(f"EcoFlow (приложение): {last}")
+
+    def start(self):
+        import threading
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        import ssl
+        import uuid
+        try:
+            import paho.mqtt.client as mqtt
+        except ImportError:
+            self.error = "не установлен paho-mqtt (обнови бота установщиком)"
+            return
+        while True:
+            try:
+                cert = self._login()
+                cid = f"ANDROID_{uuid.uuid4().hex.upper()}_{self.user_id}"
+                try:
+                    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=cid, clean_session=True)
+                except AttributeError:          # paho-mqtt 1.x
+                    c = mqtt.Client(client_id=cid, clean_session=True)
+                c.username_pw_set(cert["certificateAccount"], cert["certificatePassword"])
+                c.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+                topics = [f"/app/device/property/{self.sn}",
+                          f"/app/{self.user_id}/{self.sn}/thing/property/get_reply"]
+                c.on_connect = lambda cl, *a: [cl.subscribe(t, 1) for t in topics] and self.request()
+                c.on_message = lambda cl, ud, msg: self._on_message(msg.payload)
+                c.connect(cert["url"], int(cert["port"]), keepalive=30)
+                self.client = c
+                self.error = None
+                c.loop_start()
+                # ask for a full snapshot every 5 min; reconnect from scratch if data stops for 30 min
+                while True:
+                    time.sleep(300)
+                    self.request()
+                    if self.updated and time.time() - self.updated > 1800:
+                        raise RuntimeError("нет данных от станции 30 минут")
+            except Exception as e:  # noqa: BLE001
+                self.error = str(e)
+                print(f"ecoflow app: {e}", file=sys.stderr, flush=True)
+                try:
+                    if self.client:
+                        self.client.loop_stop()
+                        self.client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(60)
+
+    def request(self):
+        if not self.client:
+            return
+        msg = {"from": "Android", "id": str(999900000 + random.randint(10000, 99999)), "version": "1.1",
+               "moduleType": 0, "operateType": "latestQuotas", "params": {}}
+        self.client.publish(f"/app/{self.user_id}/{self.sn}/thing/property/get", json.dumps(msg), 1)
+
+    def _on_message(self, payload):
+        vals = {}
+        try:                                   # JSON reply (latestQuotas) ...
+            j = json.loads(payload)
+            q = ((j.get("data") or {}).get("quotaMap")) or j.get("params") or {}
+            vals = {k.split(".")[-1]: v for k, v in q.items() if isinstance(v, (int, float))}
+        except Exception:  # noqa: BLE001        # ... or protobuf stream
+            try:
+                vals = r3_decode(payload)
+            except Exception:  # noqa: BLE001
+                vals = {}
+        if vals:
+            self.data.update(vals)
+            self.updated = time.time()
+
+    def station(self, name):
+        d = self.data
+        if not d or not self.updated:
+            raise RuntimeError(self.error or "ждём первые данные от станции")
+        if time.time() - self.updated > 15 * 60:
+            raise RuntimeError("нет свежих данных от станции")
+        pick_ = lambda *ks: next((d[k] for k in ks if isinstance(d.get(k), (int, float))), None)  # noqa: E731
+        soc = pick_("cms_batt_soc", "bms_batt_soc")
+        if soc is None:
+            raise RuntimeError("нет данных о заряде")
+        p_in, p_out = pick_("pow_in_sum_w") or 0, pick_("pow_out_sum_w") or 0
+        charging = p_in > p_out + 5
+        rem = pick_("cms_chg_rem_time", "bms_chg_rem_time") if charging else pick_("cms_dsg_rem_time", "bms_dsg_rem_time")
+        if rem is not None and (rem <= 0 or rem >= 5999):
+            rem = None
+        grid = None
+        if pick_("plug_in_info_ac_in_flag") is not None:
+            grid = pick_("plug_in_info_ac_in_flag") == 1
+        elif pick_("plug_in_info_ac_in_vol") is not None:
+            grid = pick_("plug_in_info_ac_in_vol") > 100
+        elif pick_("pow_get_ac_in") is not None:
+            grid = pick_("pow_get_ac_in") > 5
+        return {"name": name, "soc": round(soc), "in": round(p_in), "out": round(abs(p_out)),
+                "charging": charging, "remain": rem, "grid": grid, "brand": "ecoflow",
+                "age_min": (time.time() - self.updated) / 60}
+
+
+_EF_APP = None
+
+
+def ecoflow_app():
+    global _EF_APP
+    if _EF_APP is None and EF_EMAIL and EF_PASSWORD and EF_APP_SN:
+        _EF_APP = EcoflowApp(EF_EMAIL, EF_PASSWORD, EF_APP_SN)
+        _EF_APP.start()
+    return _EF_APP
+
+
 _ms_token = None
+_ms_last_ok = {}    # name -> time of the last valid reading
+_ms_last_soc = {}   # name -> soc at that time
 _ms_raw = []    # last raw device list (for the /marstek command)
 
 
@@ -475,6 +726,16 @@ def marstek_stations():
             pass
         if float(d.get("load") or 0) > 0:
             item["load"] = round(float(d["load"]))
+        # When the battery is offline (e.g. the home router has no power during an outage)
+        # the cloud returns soc=0 and zero powers. That's "no data", not an empty battery.
+        if soc == 0 and chg == 0 and dsg == 0 and not item.get("load"):
+            last = _ms_last_ok.get(item["name"])
+            item["stale"] = f"{last:%d.%m %H:%M}" if last else "—"
+            if last:
+                item["soc"] = _ms_last_soc.get(item["name"], 0)
+        else:
+            _ms_last_ok[item["name"]] = now()
+            _ms_last_soc[item["name"]] = item["soc"]
         res.append(item)
     return res
 
@@ -499,7 +760,12 @@ def get_stations():
             with open(MOCK_STATIONS, encoding="utf-8") as f:
                 st = json.load(f)
         else:
-            if EF_AK and EF_SK and EF_SN:
+            if EF_EMAIL and EF_PASSWORD and EF_APP_SN:
+                try:
+                    st.append(ecoflow_app().station(EF_NAME))
+                except Exception as e:  # noqa: BLE001
+                    errs.append(f"EcoFlow: {e}")
+            elif EF_AK and EF_SK and EF_SN:
                 try:
                     st += ecoflow_stations()
                 except Exception as e:  # noqa: BLE001
@@ -514,14 +780,15 @@ def get_stations():
 
 
 def stations_configured():
-    return bool(MOCK_STATIONS or (EF_AK and EF_SK and EF_SN) or (MS_EMAIL and MS_PWD))
+    return bool(MOCK_STATIONS or (EF_AK and EF_SK and EF_SN) or (MS_EMAIL and MS_PWD)
+                or (EF_EMAIL and EF_PASSWORD and EF_APP_SN))
 
 
 def format_station(s):
     icon = "🪫" if s["soc"] <= (LOW_LEVELS[-1] if LOW_LEVELS else 10) else "🔋"
     line = f"{icon} <b>{s['name']}</b>: {s['soc']}%"
     if s.get("stale"):
-        return line + f" (нет связи, данные от {s['stale']})"
+        return line + f" <i>(батарея не в сети, последние данные {s['stale']})</i>"
     if s["charging"]:
         line += f" · ⚡ заряжается +{s['in']} Вт"
         if s["out"] > 5:
@@ -780,6 +1047,14 @@ def command_reply(state, text):
         since = datetime.fromisoformat(h["since"])
         return (f"{'💡 Свет есть' if h['online'] else '🔌 Света нет'} "
                 f"уже {dur(now() - since)} (с {since:%d.%m %H:%M})")
+    if cmd == "/ecoflow":
+        app = ecoflow_app()
+        if not app:
+            return "EcoFlow (вход через приложение) не настроен"
+        age = f"{(time.time() - app.updated) / 60:.0f} мин назад" if app.updated else "ещё не было"
+        body = json.dumps(app.data, ensure_ascii=False, indent=1)[:3000]
+        return (f"<b>EcoFlow</b>: данные {age}" + (f"\nОшибка: {app.error}" if app.error else "")
+                + "\n<pre>" + body.replace("<", "&lt;") + "</pre>")
     if cmd == "/marstek":
         _stations_cache = None
         get_stations()
@@ -856,7 +1131,7 @@ STATION_EVERY = int(os.environ.get("STATION_EVERY_MIN") or 2)
 def serve():
     """Always-on mode (VPS): checks every minute, instant replies to commands."""
     import threading
-    global _stations_cache
+    global _stations_cache, CHAT_ID
     if not (QUEUE and TG_TOKEN and CHAT_ID):
         sys.exit("Нужны QUEUE, TG_TOKEN и TG_CHAT_ID")
     api = f"https://api.telegram.org/bot{TG_TOKEN}"
@@ -867,11 +1142,27 @@ def serve():
         {"command": "power", "description": "Заряд станций"}]})
     lock = threading.Lock()
     state = load_state()
+    apply_chat_migration(state)
+    ecoflow_app()                          # start the EcoFlow MQTT listener if configured
+    socket.setdefaulttimeout(70)           # no network call may hang forever
+    beat = {"poll": time.time(), "check": time.time()}
+
+    def watchdog():
+        # if either loop is stuck for 6+ minutes, exit so systemd restarts the bot
+        while True:
+            time.sleep(30)
+            stuck = [k for k, v in beat.items() if time.time() - v > 360]
+            if stuck:
+                print(f"watchdog: {stuck} stuck, restarting", file=sys.stderr, flush=True)
+                os._exit(1)
+
+    threading.Thread(target=watchdog, daemon=True).start()
     print("svitlo-bot: server mode started", flush=True)
 
     def checker():
         last_st = None
         while True:
+            beat["check"] = time.time()
             t = now()
             steps = [check_schedule, check_home, check_expected, check_alerts]
             if last_st is None or t - last_st >= timedelta(minutes=STATION_EVERY):
@@ -882,6 +1173,7 @@ def serve():
                     global _stations_cache
                     _stations_cache = None
                     run_checks(state, steps)
+                    apply_chat_migration(state)
                     save_state(state)
             except Exception as e:  # noqa: BLE001  (never let the checker die)
                 print(f"checker error: {e}", file=sys.stderr, flush=True)
@@ -892,6 +1184,7 @@ def serve():
 
     offset = 0
     while True:
+        beat["poll"] = time.time()
         if not worker.is_alive():          # let systemd restart the whole bot
             sys.exit("checker thread stopped")
         try:
@@ -904,7 +1197,20 @@ def serve():
         for u in upd.get("result", []):
             offset = u["update_id"] + 1
             msg = u.get("message") or {}
-            if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
+            chat = str(msg.get("chat", {}).get("id"))
+            if chat == str(CHAT_ID) and msg.get("migrate_to_chat_id"):
+                CHAT_ID = str(msg["migrate_to_chat_id"])          # group upgraded
+                with lock:
+                    apply_chat_migration(state)
+                    save_state(state)
+                continue
+            if chat != str(CHAT_ID) and str(msg.get("migrate_from_chat_id")) == str(CHAT_ID):
+                CHAT_ID = chat
+                with lock:
+                    apply_chat_migration(state)
+                    save_state(state)
+                continue
+            if chat != str(CHAT_ID):
                 continue
             with lock:
                 try:
