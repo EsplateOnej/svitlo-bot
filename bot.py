@@ -189,7 +189,85 @@ def fetch_schedule():
             raise RuntimeError(f"YASNO API недоступен: {last}")
     if QUEUE not in data:
         raise KeyError(f"Очередь {QUEUE} не найдена. Есть: {', '.join(sorted(data))}")
-    return data[QUEUE]
+    g = dict(data[QUEUE])
+    if not MOCK and DTEK_URL:
+        merge_dtek(g)
+    return g
+
+
+# ---------------------------------------------------------------- DTEK hourly schedule
+# The DTEK site (and the Kyiv Digital app) publish an hourly schedule per queue even when
+# YASNO reports "emergency shutdowns" without hours. When DTEK has data for a day, use it.
+DTEK_URL = os.environ.get("DTEK_URL", "https://www.dtek-kem.com.ua/ua/shutdowns").strip()
+_dtek_cache = {"t": 0, "fact": None, "err": None}
+
+
+def fetch_dtek_fact():
+    """DisconSchedule.fact from the DTEK page: {"data": {unix_day: {"GPV18.1": {"1": "yes"...}}}}."""
+    if time.time() - _dtek_cache["t"] < 240:           # the page is heavy: at most every 4 min
+        return _dtek_cache["fact"]
+    _dtek_cache["t"] = time.time()
+    try:
+        req = urllib.request.Request(DTEK_URL, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "text/html", "Accept-Language": "uk,ru;q=0.9"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            html = r.read().decode("utf-8", "replace")
+        i = html.index("DisconSchedule.fact")
+        j = html.index("{", i)
+        depth = 0
+        for k in range(j, len(html)):
+            if html[k] == "{":
+                depth += 1
+            elif html[k] == "}":
+                depth -= 1
+                if not depth:
+                    break
+        _dtek_cache["fact"] = json.loads(html[j:k + 1])
+        _dtek_cache["err"] = None
+    except Exception as e:  # noqa: BLE001
+        _dtek_cache["err"] = f"{type(e).__name__}: {e}"
+        print(f"dtek: {_dtek_cache['err']}", file=sys.stderr, flush=True)
+    return _dtek_cache["fact"]
+
+
+def dtek_day(hours, date_):
+    """24 hourly states -> a YASNO-style day ('no' = outage, 'first'/'second' = half hour)."""
+    slots = []
+    for h in range(24):
+        st = str(hours.get(str(h + 1), "yes")).lower()
+        a = h * 60
+        if st == "no":
+            slots.append({"start": a, "end": a + 60, "type": "Definite"})
+        elif st == "first":
+            slots.append({"start": a, "end": a + 30, "type": "Definite"})
+        elif st == "second":
+            slots.append({"start": a + 30, "end": a + 60, "type": "Definite"})
+        elif st in ("maybe", "mfirst", "msecond"):
+            slots.append({"start": a, "end": a + 60, "type": "Possible"})
+    return {"date": f"{date_.isoformat()}T00:00:00+03:00", "status": "ScheduleApplies",
+            "slots": slots, "source": "dtek"}
+
+
+def merge_dtek(g):
+    fact = fetch_dtek_fact()
+    if not fact:
+        return
+    key = f"GPV{QUEUE}"
+    by_date = {}
+    for ts, groups in (fact.get("data") or {}).items():
+        if isinstance(groups, dict) and key in groups:
+            by_date[datetime.fromtimestamp(int(ts), TZ).date()] = groups[key]
+    for k in ("today", "tomorrow"):
+        day = g.get(k)
+        if not day:
+            continue
+        d = day_date(day)
+        if d in by_date:
+            new = dtek_day(by_date[d], d)
+            new["yasno_status"] = day.get("status")
+            g[k] = new
 
 
 def day_date(day):
@@ -215,7 +293,11 @@ def format_day(title, day):
         return f"<b>{title}</b>: нет данных"
     d = day_date(day).strftime("%d.%m")
     status = day.get("status", "")
-    lines = [f"<b>{title} ({d})</b> — {STATUS_TEXT.get(status, status)}"]
+    st_text = STATUS_TEXT.get(status, status)
+    if day.get("source") == "dtek":
+        st_text = ("⚠️ аварийный график ДТЭК" if day.get("yasno_status") == "EmergencyShutdowns"
+                   else "график ДТЭК")
+    lines = [f"<b>{title} ({d})</b> — {st_text}"]
     if status == "ScheduleApplies":
         offs = outages(day)
         if offs:
@@ -225,6 +307,16 @@ def format_day(title, day):
             lines.append(f"  Без света: {total // 60} ч {total % 60:02d} мин")
         else:
             lines.append("  🟢 отключений не запланировано")
+        maybe = []
+        for s_ in sorted(day.get("slots", []), key=lambda x: x["start"]):
+            if s_.get("type") != "Possible":
+                continue
+            if maybe and maybe[-1][1] >= s_["start"]:
+                maybe[-1][1] = max(maybe[-1][1], s_["end"])
+            else:
+                maybe.append([s_["start"], s_["end"]])
+        if maybe:
+            lines.append("  ⚪ возможны: " + ", ".join(f"{hm(a)}–{hm(b)}" for a, b in maybe))
     return "\n".join(lines)
 
 
@@ -293,7 +385,12 @@ def check_schedule(state):
         if first_run or silent or old == cur:
             continue
         label = f"{title} ({day_date(day):%d.%m})"
-        if cur["status"] == "EmergencyShutdowns":
+        if day.get("source") == "dtek":
+            head = ("🚨 <b>Аварийный график ДТЭК</b>" if day.get("yasno_status") == "EmergencyShutdowns"
+                    else "📅 <b>График ДТЭК</b>")
+            verb = "обновлён" if old and old.get("status") == "ScheduleApplies" else "опубликован"
+            msgs.append(f"{head} на {label} {verb}\n\n" + format_day(title.capitalize(), day))
+        elif cur["status"] == "EmergencyShutdowns":
             if not old or old["status"] != "EmergencyShutdowns":
                 msgs.append(f"🚨 <b>Аварийные отключения</b> на {label}!\n"
                             f"Графики сейчас не действуют, свет могут отключить в любой момент.")
